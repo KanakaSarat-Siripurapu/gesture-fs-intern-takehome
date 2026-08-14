@@ -12,9 +12,27 @@ Useful docs:
   - HuggingFace pipelines: https://python.langchain.com/docs/integrations/llms/huggingface_pipelines/
 """
 
+import argparse
 import os
+import sys
+from typing import Callable, Dict, List
+
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
 from src.knowledge_base import build_knowledge_base
+
+# Number of chunks pulled from the vector store for each question.
+TOP_K = 3
+
+# flan-t5-base truncates its input at 512 tokens. Three 500-character chunks
+# plus the template can exceed that, and because the question sits at the END
+# of the prompt it is the first thing to get cut, which produces answers that
+# ignore what was actually asked. Capping the context keeps the question inside
+# the window.
+MAX_CONTEXT_CHARS = 1200
+
+# Shown when retrieval or generation comes back empty.
+NO_ANSWER = "I don't have enough information to answer that."
 
 
 # ──────────────────────────────────────────────
@@ -58,17 +76,27 @@ Answer:"""
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TODO 1: Implement ask_question
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def ask_question(vector_store, llm, question: str) -> dict:
-    """Retrieve relevant chunks and generate an answer.
+def _build_context(sources: List[str], max_chars: int = MAX_CONTEXT_CHARS) -> str:
+    """Join retrieved chunks into one context string, bounded by max_chars.
 
-    Steps:
-      1. Use vector_store.similarity_search(question, k=3) to get
-         the top 3 most relevant document chunks.
-      2. Combine the chunk text into a single context string.
-         (Hint: each chunk has a .page_content attribute)
-      3. Format the PROMPT_TEMPLATE with the context and question.
-      4. Pass the formatted prompt to llm(...) and extract the
-         generated text from the result.
+    Chunks arrive best-match-first, so filling greedily from the front keeps the
+    most relevant text and drops only the weakest matches when space runs out.
+    """
+    context, used = [], 0
+    for source in sources:
+        text = source.strip()
+        if not text:
+            continue
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        context.append(text[:remaining])
+        used += min(len(text), remaining) + 2  # +2 for the joining newlines
+    return "\n\n".join(context)
+
+
+def ask_question(vector_store, llm: Callable, question: str) -> Dict[str, object]:
+    """Retrieve relevant chunks and generate an answer.
 
     Args:
         vector_store: FAISS vector store from knowledge_base.py
@@ -80,31 +108,101 @@ def ask_question(vector_store, llm, question: str) -> dict:
             "answer"  -> str: the generated answer
             "sources" -> list[str]: the chunk texts that were retrieved
     """
-    # TODO: implement this (~6-8 lines)
-    raise NotImplementedError("TODO 1: Implement ask_question")
+    question = (question or "").strip()
+    if not question:
+        return {"answer": "Please ask a question.", "sources": []}
+
+    # 1. Retrieve the most relevant chunks.
+    docs = vector_store.similarity_search(question, k=TOP_K)
+    sources: List[str] = [doc.page_content for doc in docs]
+    if not sources:
+        return {"answer": NO_ANSWER, "sources": []}
+
+    # 2 & 3. Combine the chunks into context and fill the prompt template.
+    prompt = PROMPT_TEMPLATE.format(
+        context=_build_context(sources), question=question
+    )
+
+    # 4. Generate, and extract just the answer text.
+    result = llm(prompt)
+    answer = result[0]["generated_text"].strip()
+
+    return {"answer": answer or NO_ANSWER, "sources": sources}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TODO 2: Complete the interactive loop
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def main():
-    """Interactive Q&A loop.
+def format_result(result: Dict[str, object]) -> str:
+    """Render an ask_question() result for the terminal."""
+    lines = ["", "📄 Sources:"]
+    sources = result.get("sources") or []
+    if sources:
+        for i, source in enumerate(sources, start=1):
+            snippet = " ".join(source.split())
+            if len(snippet) > 200:
+                snippet = snippet[:200].rstrip() + "..."
+            lines.append(f"{i}. {snippet}")
+    else:
+        lines.append("(none)")
+    lines.append("")
+    lines.append(f"💬 Answer: {result.get('answer', NO_ANSWER)}")
+    return "\n".join(lines)
 
-    Steps:
-      1. Build the knowledge base using build_knowledge_base()
-         with the data/ directory path.
-      2. Load the LLM using get_llm().
-      3. Start a loop that:
-         - Prompts the user for a question with input()
-         - Exits if they type "quit"
-         - Calls ask_question() with their input
-         - Prints the retrieved sources and the answer
-    """
+
+def main() -> int:
+    """Interactive Q&A loop (or a single answer with --query)."""
     data_dir = os.path.join(os.path.dirname(__file__), "..", "data")
 
-    # TODO: implement this (~10-12 lines)
-    raise NotImplementedError("TODO 2: Complete the interactive loop")
+    parser = argparse.ArgumentParser(
+        description="Ask questions about the agency's services, pricing, and process."
+    )
+    parser.add_argument(
+        "--query",
+        help="Answer a single question and exit instead of starting the CLI loop.",
+    )
+    args = parser.parse_args()
+
+    if not os.path.isdir(data_dir):
+        print(f"Error: data directory not found at {os.path.abspath(data_dir)}")
+        return 1
+
+    # 1 & 2. Build the knowledge base and load the model.
+    try:
+        vector_store = build_knowledge_base(data_dir)
+        print("Loading the language model (first run downloads ~1GB)...")
+        llm = get_llm()
+        print("  Done!\n")
+    except Exception as exc:  # noqa: BLE001 - surface setup failures to the user
+        print(f"Error: could not start the assistant ({exc})")
+        return 1
+
+    # Single-question mode.
+    if args.query:
+        print(format_result(ask_question(vector_store, llm, args.query)))
+        return 0
+
+    # 3. Interactive loop.
+    print("Ask about our services, pricing, or process. Type 'quit' to exit.")
+    while True:
+        try:
+            question = input("\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye!")
+            return 0
+
+        if question.lower() in {"quit", "exit", "q"}:
+            print("Goodbye!")
+            return 0
+        if not question:
+            print("Please enter a question, or type 'quit' to exit.")
+            continue
+
+        try:
+            print(format_result(ask_question(vector_store, llm, question)))
+        except Exception as exc:  # noqa: BLE001 - keep the session alive on errors
+            print(f"Sorry, something went wrong answering that ({exc}). Try again.")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
